@@ -1,0 +1,13 @@
+{
+  "name": "optionsx-bot",
+  "version": "1.0.0",
+  "description": "Options X Discord Bot",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.0.0",
+    "node-cron": "^3.0.0"
+  }
+}
