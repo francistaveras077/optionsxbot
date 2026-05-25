@@ -1,7 +1,13 @@
 const { Client, GatewayIntentBits, PermissionsBitField } = require('discord.js');
 const cron = require('node-cron');
 
-const TOKEN = 'MTUwODUwNjUwNTM4NzgzNTQ0Mg.G9KdfW.kzHgIlH0AqgpsDH0B4XjrLlGEx7ry96HdrDg7c';
+// Token comes from environment variable — never hardcoded
+const TOKEN = process.env.DISCORD_TOKEN;
+
+if (!TOKEN) {
+  console.error('❌ DISCORD_TOKEN environment variable not set');
+  process.exit(1);
+}
 
 const client = new Client({
   intents: [
@@ -38,7 +44,6 @@ const premiumMessages = {
 → [Key news item]
 
 ─────────────────────
-Edit this message before it posts or let it auto-publish.
 Stay focused. Stay disciplined. ⚡`,
 
   watchlist: () => `📋 **WEEKLY WATCHLIST** — Week of ${new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric' })}
@@ -107,7 +112,7 @@ Consistency beats perfection. ⚡`,
 💰 Entry: $X.XX — $X.XX
 🛑 Stop Loss: $X.XX
 ✅ Target: $X.XX+
-📈 Setup: CHoCH + Liquidity Sweep
+📈 Setup: CHoCH + Liquidity Sweep + EMA confirmation
 ⚠️ Risk: Low / Medium / High
 🔢 Suggested contracts: 1-3
 
@@ -179,11 +184,8 @@ client.once('ready', () => {
 
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
-  
-  // Only admin can use commands
   if (!message.member?.permissions.has(PermissionsBitField.Flags.Administrator)) return;
 
-  // !signal — post signal template to premium-signals
   if (message.content === '!signal') {
     const ch = getChannel(message.guild, 'premium-signals');
     if (ch) {
@@ -203,7 +205,6 @@ client.on('messageCreate', async (message) => {
     }
   }
 
-  // !wheel — post wheel update template
   if (message.content === '!wheel') {
     const ch = getChannel(message.guild, 'wheel-strategy');
     if (ch) {
@@ -220,7 +221,6 @@ client.on('messageCreate', async (message) => {
     }
   }
 
-  // !premarket — manually trigger premarket
   if (message.content === '!premarket') {
     const ch = getChannel(message.guild, 'premarket-daily');
     if (ch) {
@@ -229,7 +229,6 @@ client.on('messageCreate', async (message) => {
     }
   }
 
-  // !recap — manually trigger recap
   if (message.content === '!recap') {
     const ch = getChannel(message.guild, 'weekly-recaps');
     if (ch) {
@@ -238,7 +237,6 @@ client.on('messageCreate', async (message) => {
     }
   }
 
-  // !watchlist — manually trigger watchlist
   if (message.content === '!watchlist') {
     const ch = getChannel(message.guild, 'weekly-watchlist');
     if (ch) {
@@ -247,7 +245,6 @@ client.on('messageCreate', async (message) => {
     }
   }
 
-  // !help — show all commands
   if (message.content === '!help') {
     await message.reply(`⚡ **OPTIONS X BOT COMMANDS**
 
