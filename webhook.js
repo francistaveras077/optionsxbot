@@ -3,11 +3,11 @@ const { Client, GatewayIntentBits } = require('discord.js');
 
 const app = express();
 app.use(express.json());
+app.use(express.text());
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const PORT = process.env.PORT || 3000;
 
-// Discord client
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -18,94 +18,131 @@ const client = new Client({
 client.login(TOKEN);
 
 client.once('ready', () => {
-  console.log(`✅ Options X Webhook Bot online as ${client.user.tag}`);
+  console.log(`✅ Options X Webhook online as ${client.user.tag}`);
 });
 
-// Find channel by partial name
 function getChannel(guild, name) {
   return guild.channels.cache.find(c =>
     c.name.toLowerCase().includes(name.toLowerCase())
   );
 }
 
-// Format signal based on alert type
-function formatSignal(data) {
-  const { ticker, signal, price, timeframe } = data;
+// Parse simple alert format:
+// "NVDA 130 CALL entry 2.20 stop 1.20 exit 3.40"
+// "SPY 520 PUT entry 1.50 stop 0.80 exit 2.80"
+function parseAlert(text) {
+  try {
+    const clean = text.trim().toUpperCase();
+    const words = clean.split(/\s+/);
 
-  let type = '';
-  let risk = 'Medium';
-  let setup = '';
+    const result = {
+      ticker: null,
+      strike: null,
+      type: null,
+      entry: null,
+      stop: null,
+      exit: null,
+    };
 
-  if (signal.toLowerCase().includes('bullish') || signal.toLowerCase().includes('buy')) {
-    type = 'Call 📈';
-    setup = signal;
-  } else if (signal.toLowerCase().includes('bearish') || signal.toLowerCase().includes('sell')) {
-    type = 'Put 📉';
-    setup = signal;
-  } else {
-    type = 'Call / Put';
-    setup = signal;
+    // Get ticker — first word
+    result.ticker = words[0];
+
+    // Get type — CALL or PUT anywhere in message
+    if (clean.includes('CALL')) result.type = 'Call 📈';
+    if (clean.includes('PUT')) result.type = 'Put 📉';
+
+    // Get strike — number before CALL/PUT or after ticker
+    for (let i = 1; i < words.length; i++) {
+      if (!isNaN(words[i]) && !result.strike && words[i].length <= 6) {
+        result.strike = words[i];
+      }
+    }
+
+    // Get entry, stop, exit values
+    for (let i = 0; i < words.length; i++) {
+      if (words[i] === 'ENTRY' && words[i+1]) result.entry = words[i+1];
+      if (words[i] === 'STOP' && words[i+1]) result.stop = words[i+1];
+      if ((words[i] === 'EXIT' || words[i] === 'TARGET') && words[i+1]) result.exit = words[i+1];
+    }
+
+    return result;
+  } catch (e) {
+    console.error('Parse error:', e);
+    return null;
   }
+}
 
-  // Calculate rough strike suggestions
-  const priceNum = parseFloat(price);
-  const callStrike = Math.ceil(priceNum * 1.01);
-  const putStrike = Math.floor(priceNum * 0.99);
-  const strike = type.includes('Call') ? callStrike : putStrike;
+function formatSignal(parsed, rawPrice) {
+  const { ticker, strike, type, entry, stop, exit } = parsed;
 
-  return `⚡ **OPTIONS X SIGNAL** *(Auto-detected)*
+  // Calculate expiration — next Friday by default
+  const today = new Date();
+  const daysUntilFriday = (5 - today.getDay() + 7) % 7 || 7;
+  const nextFriday = new Date(today);
+  nextFriday.setDate(today.getDate() + daysUntilFriday);
+  const expDate = nextFriday.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+
+  return `⚡ **OPTIONS X SIGNAL**
 
 📌 **Ticker:** ${ticker}
-📊 **Type:** ${type}
-🎯 **Strike:** $${strike} *(adjust based on chain)*
-📅 **Exp:** 1-2 weeks out
-💰 **Entry:** Market open
-🛑 **Stop:** Below/Above key EMA
-✅ **Target:** 50-100% gain
-📈 **Setup:** ${setup} on ${timeframe}
-⚠️ **Risk:** ${risk}
+📊 **Type:** ${type || 'Call/Put'}
+🎯 **Strike:** $${strike || 'TBD'}
+📅 **Exp:** ${expDate}
+💰 **Entry:** $${entry || 'Market'}
+🛑 **Stop Loss:** $${stop || 'TBD'}
+✅ **Target:** $${exit || 'TBD'}
+📈 **Setup:** Key level triggered — confirm on 15m
+⚠️ **Risk:** Medium
 🔢 **Suggested contracts:** 1-3
 
 ⚠️ *Always confirm entry on 15m before executing*`;
 }
 
-// Webhook endpoint — TradingView sends alerts here
+// Main webhook endpoint
 app.post('/webhook', async (req, res) => {
   try {
-    console.log('📨 Alert received:', req.body);
+    // Accept both text and JSON
+    let alertText = '';
 
-    const data = req.body;
+    if (typeof req.body === 'string') {
+      alertText = req.body;
+    } else if (req.body && req.body.message) {
+      alertText = req.body.message;
+    } else if (req.body && req.body.text) {
+      alertText = req.body.text;
+    } else {
+      alertText = JSON.stringify(req.body);
+    }
 
-    // Expected format from TradingView:
-    // { "ticker": "NVDA", "signal": "Bullish CHoCH", "price": "127.50", "timeframe": "1H" }
+    console.log('📨 Alert received:', alertText);
 
-    if (!data.ticker || !data.signal) {
-      return res.status(400).json({ error: 'Missing ticker or signal' });
+    const parsed = parseAlert(alertText);
+
+    if (!parsed || !parsed.ticker) {
+      return res.status(400).json({ error: 'Could not parse alert' });
     }
 
     const guild = client.guilds.cache.first();
-    if (!guild) {
-      return res.status(500).json({ error: 'Bot not in guild' });
-    }
+    if (!guild) return res.status(500).json({ error: 'Bot not in guild' });
 
-    const message = formatSignal(data);
+    const message = formatSignal(parsed);
 
     // Post to premium-signals
     const premiumCh = getChannel(guild, 'premium-signals');
     if (premiumCh) {
       await premiumCh.send(message);
-      console.log(`✅ Signal posted for ${data.ticker}`);
+      console.log(`✅ Signal posted: ${alertText}`);
     }
 
-    // If SPY or QQQ also post market analysis
-    if (['SPY', 'QQQ'].includes(data.ticker?.toUpperCase())) {
+    // If SPY or QQQ also post to market-analysis
+    if (['SPY', 'QQQ'].includes(parsed.ticker)) {
       const analysisCh = getChannel(guild, 'market-analysis');
       if (analysisCh) {
-        await analysisCh.send(`📊 **MARKET ALERT — ${data.ticker}**\n${data.signal} detected at $${data.price} on ${data.timeframe}`);
+        await analysisCh.send(`📊 **MARKET ALERT — ${parsed.ticker} ${parsed.type || ''}**\nKey level triggered. Check #premium-signals for full details.`);
       }
     }
 
-    res.json({ success: true, ticker: data.ticker });
+    res.json({ success: true, parsed });
 
   } catch (error) {
     console.error('❌ Webhook error:', error);
@@ -115,13 +152,14 @@ app.post('/webhook', async (req, res) => {
 
 // Health check
 app.get('/', (req, res) => {
-  res.json({ 
-    status: 'Options X Webhook Active ⚡',
+  res.json({
+    status: '⚡ Options X Webhook Active',
+    format: 'NVDA 130 CALL entry 2.20 stop 1.20 exit 3.40',
     tickers: ['SPY', 'QQQ', 'NVDA', 'AAPL', 'AMD'],
     timestamp: new Date().toISOString()
   });
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Webhook server running on port ${PORT}`);
+  console.log(`🚀 Webhook server on port ${PORT}`);
 });
