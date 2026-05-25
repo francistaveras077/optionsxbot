@@ -1,7 +1,6 @@
 const { Client, GatewayIntentBits, PermissionsBitField } = require('discord.js');
 const cron = require('node-cron');
 
-// Token comes from environment variable — never hardcoded
 const TOKEN = process.env.DISCORD_TOKEN;
 
 if (!TOKEN) {
@@ -69,7 +68,7 @@ Stay focused. Stay disciplined. ⚡`,
 → [Key macro theme or catalyst]
 
 ─────────────────────
-Update tickers before Monday 8am EST ⚡`,
+Stay one step ahead. ⚡`,
 
   recap: () => `📅 **WEEKLY RECAP** — ${new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric' })}
 
@@ -122,10 +121,13 @@ Upgrade to Premium 👇
 [Your Whop Link]`
 };
 
-// ─── FIND CHANNEL ────────────────────────────────────────
+// ─── FIND CHANNEL BY PARTIAL NAME ────────────────────────
+// Searches by partial match to handle emojis in channel names
 
 function getChannel(guild, name) {
-  return guild.channels.cache.find(c => c.name === name);
+  return guild.channels.cache.find(c => 
+    c.name.toLowerCase().includes(name.toLowerCase())
+  );
 }
 
 // ─── SCHEDULED JOBS ──────────────────────────────────────
@@ -140,6 +142,10 @@ client.once('ready', () => {
   }
 
   console.log(`📡 Connected to: ${guild.name}`);
+  
+  // Log all channels for debugging
+  console.log('📋 Channels found:');
+  guild.channels.cache.forEach(c => console.log(`  - ${c.name}`));
 
   // Premarket — Mon-Fri at 8:00am EST (13:00 UTC)
   cron.schedule('0 13 * * 1-5', async () => {
@@ -147,6 +153,8 @@ client.once('ready', () => {
     if (ch) {
       await ch.send(premiumMessages.premarket());
       console.log('✅ Premarket posted');
+    } else {
+      console.log('❌ premarket-daily channel not found');
     }
   });
 
@@ -202,6 +210,8 @@ client.on('messageCreate', async (message) => {
 ⚠️ Risk: 
 🔢 Suggested contracts: 1-3`);
       await message.reply('✅ Signal template posted in #premium-signals');
+    } else {
+      await message.reply('❌ Could not find premium-signals channel');
     }
   }
 
@@ -218,6 +228,8 @@ client.on('messageCreate', async (message) => {
 📊 Current position: 
 ✅ Status: Open / Closed`);
       await message.reply('✅ Wheel template posted');
+    } else {
+      await message.reply('❌ Could not find wheel-strategy channel');
     }
   }
 
@@ -226,6 +238,8 @@ client.on('messageCreate', async (message) => {
     if (ch) {
       await ch.send(premiumMessages.premarket());
       await message.reply('✅ Premarket posted');
+    } else {
+      await message.reply('❌ Could not find premarket-daily channel');
     }
   }
 
@@ -234,6 +248,8 @@ client.on('messageCreate', async (message) => {
     if (ch) {
       await ch.send(premiumMessages.recap());
       await message.reply('✅ Recap posted');
+    } else {
+      await message.reply('❌ Could not find weekly-recaps channel');
     }
   }
 
@@ -242,7 +258,26 @@ client.on('messageCreate', async (message) => {
     if (ch) {
       await ch.send(premiumMessages.watchlist());
       await message.reply('✅ Watchlist posted');
+    } else {
+      await message.reply('❌ Could not find weekly-watchlist channel');
     }
+  }
+
+  if (message.content === '!freesignal') {
+    const ch = getChannel(message.guild, 'free-signals');
+    if (ch) {
+      await ch.send(premiumMessages.freeSignal());
+      await message.reply('✅ Free signal posted');
+    } else {
+      await message.reply('❌ Could not find free-signals channel');
+    }
+  }
+
+  if (message.content === '!channels') {
+    const list = message.guild.channels.cache
+      .map(c => `• ${c.name}`)
+      .join('\n');
+    await message.reply(`📋 **Channels:**\n${list}`);
   }
 
   if (message.content === '!help') {
@@ -253,6 +288,8 @@ client.on('messageCreate', async (message) => {
 \`!premarket\` — Post premarket manually
 \`!watchlist\` — Post watchlist manually
 \`!recap\` — Post weekly recap manually
+\`!freesignal\` — Post free signal manually
+\`!channels\` — List all channels (debug)
 \`!help\` — Show this menu
 
 **Auto Schedule:**
