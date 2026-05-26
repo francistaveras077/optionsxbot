@@ -80,7 +80,6 @@ async function getBestContract(ticker, type) {
     if (contracts.length === 0) return null;
 
     const symbols = contracts.slice(0, 30).map(c => c.symbol).join(',');
-
     const snapshotRes = await fetch(
       `https://data.alpaca.markets/v1beta1/options/snapshots?symbols=${symbols}&feed=indicative`,
       { headers: alpacaHeaders }
@@ -110,23 +109,53 @@ async function getBestContract(ticker, type) {
         const expDate = new Date(c.expiration_date);
         const daysOut = Math.floor((expDate - today) / (1000 * 60 * 60 * 24));
         const spread = ask - bid;
-        const expFormatted = expDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+        const expFormatted = expDate.toLocaleDateString('en-US', { month: '2-digit', day: '2-digit' }).replace(/\//g, '/');
+
+        // ─── SCORING SYSTEM ───────────────────────────────
 
         let score = 0;
+
+        // Delta — prefer ATM 0.40-0.55
         if (delta >= 0.40 && delta <= 0.55) score += 50;
         else if (delta >= 0.30 && delta <= 0.65) score += 30;
         else if (delta >= 0.20 && delta <= 0.75) score += 10;
+
+        // Days to expiration
         if (daysOut >= 7 && daysOut <= 21) score += 30;
         else if (daysOut >= 5 && daysOut <= 30) score += 15;
+
+        // Volume
         if (volume > 500) score += 20;
         else if (volume > 100) score += 10;
+
+        // Spread quality
         if (ask > 0 && spread / ask < 0.10) score += 15;
         else if (ask > 0 && spread / ask < 0.20) score += 5;
+
+        // Open Interest
         if (oi > 100) score += 10;
+
+        // ─── NEW: Vol/OI ratio — unusual activity ─────────
+        const volOiRatio = oi > 0 ? volume / oi : 0;
+        if (volOiRatio > 3.0) score += 30; // very unusual — big money moving
+        else if (volOiRatio > 1.5) score += 15; // unusual activity
+
+        // ─── NEW: Theta penalty — avoid high decay ────────
+        const thetaPct = ask > 0 ? Math.abs(theta) / ask : 0;
+        if (thetaPct > 0.08) score -= 25; // losing >8% per day — too expensive
+        else if (thetaPct > 0.05) score -= 10; // losing >5% per day — caution
+
+        // ─── NEW: Expected move check ─────────────────────
+        const expectedMove = currentPrice * iv * Math.sqrt(daysOut / 365);
+        // Reward if target (2x entry) is within expected move
+        const target = ask * 2.0;
+        const priceTarget = isCall ? currentPrice + (target / 0.5) : currentPrice - (target / 0.5);
+        if (Math.abs(priceTarget - currentPrice) <= expectedMove) score += 15;
 
         return {
           symbol: c.symbol, strike, bid, ask, delta, gamma, theta, vega,
-          iv, volume, oi, daysOut, expDate: expFormatted, score, spread, currentPrice
+          iv, volume, oi, daysOut, expDate: expFormatted, score, spread,
+          currentPrice, volOiRatio, thetaPct, expectedMove
         };
       })
       .filter(c => c && c.ask > 0 && c.bid > 0 && c.daysOut >= 5)
@@ -147,77 +176,56 @@ function parseAlert(text) {
   const words = clean.split(/\s+/);
   const ticker = words[0];
   const type = clean.includes('CALL') ? 'CALL' : clean.includes('PUT') ? 'PUT' : null;
-
-  // Extract setup if provided — everything after CALL/PUT
   const setupMatch = clean.match(/(?:CALL|PUT)\s+(.+)/);
   const setup = setupMatch ? setupMatch[1].replace(/\+/g, ' + ') : null;
-
   return { ticker, type, setup };
 }
 
 // ─── FORMAT SIGNAL ────────────────────────────────────────
 
 function formatSignal(ticker, type, setup, c) {
-  const typeEmoji = type === 'CALL' ? 'Call 📈' : 'Put 📉';
+  const typeEmoji = type === 'CALL' ? 'CALL' : 'PUT';
   const setupText = setup || 'Key level triggered';
 
   if (!c) {
-    return `⚡ **OPTIONS X SIGNAL**
-
-📌 **Ticker:** ${ticker}
-📊 **Type:** ${typeEmoji}
-📈 **Setup:** ${setupText} — confirm on 15m
-⚠️ *Options data unavailable — check chain manually*
-🔢 **Suggested contracts:** 1-3
-
-⚠️ *Always confirm entry on 15m before executing*`;
+    return `⚡ **${ticker} ${typeEmoji}**
+📈 *${setupText}*
+⚠️ Check chain manually — confirm on 15m`;
   }
 
+  // Format expiration as MM/DD
   const stop = (c.bid * 0.55).toFixed(2);
   const target = (c.ask * 2.0).toFixed(2);
-  const risk = c.bid;
-  const reward = c.ask * 2.0 - c.ask;
-  const rr = (reward / risk).toFixed(1);
-  const ivPct = (c.iv * 100).toFixed(1);
-  const spreadPct = c.ask > 0 ? ((c.spread / c.ask) * 100).toFixed(1) : 'N/A';
+  const rr = ((c.ask * 2.0 - c.ask) / c.bid).toFixed(1);
 
-  // Delta quality rating
-  let deltaRating = '';
-  if (c.delta >= 0.45 && c.delta <= 0.55) deltaRating = '🟢 ATM';
-  else if (c.delta >= 0.35 && c.delta <= 0.65) deltaRating = '🟡 Near ATM';
-  else if (c.delta > 0.65) deltaRating = '🔵 ITM';
-  else deltaRating = '🔴 OTM';
+  // Delta rating
+  let deltaRating = c.delta >= 0.45 && c.delta <= 0.55 ? '🟢' : c.delta >= 0.35 ? '🟡' : '🔴';
 
-  // IV rating
-  let ivRating = '';
-  if (c.iv < 0.30) ivRating = '🟢 Low';
-  else if (c.iv < 0.50) ivRating = '🟡 Normal';
-  else ivRating = '🔴 High';
+  // IV rating  
+  let ivRating = c.iv < 0.30 ? '🟢' : c.iv < 0.50 ? '🟡' : '🔴';
 
-  return `⚡ **OPTIONS X SIGNAL**
+  // Vol/OI signal
+  let flowSignal = '';
+  if (c.volOiRatio > 3.0) flowSignal = ' 🔥 UNUSUAL FLOW';
+  else if (c.volOiRatio > 1.5) flowSignal = ' ⚡ Active';
 
-📌 **Ticker:** ${ticker} @ $${c.currentPrice}
-📊 **Type:** ${typeEmoji}
-🎯 **Strike:** $${c.strike}
-📅 **Exp:** ${c.expDate} (${c.daysOut} days)
+  // Main visible signal — clean and compact
+  const mainSignal = `⚡ **${ticker} $${c.strike} ${typeEmoji} ${c.expDate}**
+**ENTRY BID** $${c.bid.toFixed(2)} | **STOP** $${stop} | **EXIT** $${target}${flowSignal}`;
 
-💰 **Entry:** $${c.bid.toFixed(2)} — $${c.ask.toFixed(2)}
-🛑 **Stop Loss:** $${stop} (45% below bid)
-✅ **Target:** $${target}+ (2x)
-⚖️ **Risk/Reward:** 1:${rr}
+  // Hidden system data — collapsed in details
+  const systemData = `
+||**— SYSTEM DATA —**
+📊 Delta: ${c.delta.toFixed(2)} ${deltaRating} | IV: ${(c.iv * 100).toFixed(1)}% ${ivRating}
+📊 Theta: -$${Math.abs(c.theta).toFixed(3)}/day | Vega: ${c.vega.toFixed(3)}
+📊 Volume: ${c.volume?.toLocaleString()} | OI: ${c.oi?.toLocaleString()}
+📊 Vol/OI: ${c.volOiRatio.toFixed(2)} | Spread: ${c.ask > 0 ? ((c.spread / c.ask) * 100).toFixed(1) : 'N/A'}%
+📊 Expected Move: ±$${c.expectedMove.toFixed(2)}
+⚖️ Risk/Reward: 1:${rr}
+📈 Setup: ${setupText}
+⚠️ Always confirm on 15m before executing||`;
 
-📊 **Delta:** ${c.delta.toFixed(2)} ${deltaRating}
-📊 **IV:** ${ivPct}% ${ivRating}
-📊 **Theta:** $${Math.abs(c.theta).toFixed(3)}/day
-📊 **Volume:** ${c.volume?.toLocaleString()}
-📊 **Open Interest:** ${c.oi?.toLocaleString()}
-📊 **Spread:** ${spreadPct}%
-
-📈 **Setup:** ${setupText}
-⚠️ **Risk:** Medium
-🔢 **Suggested contracts:** 1-3
-
-⚠️ *Always confirm entry on 15m before executing*`;
+  return mainSignal + systemData;
 }
 
 // ─── WEBHOOK ─────────────────────────────────────────────
@@ -265,7 +273,7 @@ app.get('/', (req, res) => {
   res.json({
     status: '⚡ Options X Webhook Active',
     format: 'NVDA CALL or NVDA CALL CHoCH+EMA',
-    features: ['Delta', 'IV', 'Theta', 'Volume', 'OI', 'Spread', 'Risk/Reward'],
+    scoring: ['Delta', 'DTE', 'Volume', 'Spread', 'OI', 'Vol/OI ratio', 'Theta decay', 'Expected move'],
     timestamp: new Date().toISOString()
   });
 });
