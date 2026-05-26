@@ -11,10 +11,7 @@ const ALPACA_SECRET = process.env.ALPACA_SECRET;
 const PORT = process.env.PORT || 3000;
 
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-  ]
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
 });
 
 client.login(TOKEN);
@@ -24,93 +21,143 @@ function getChannel(guild, name) {
   return guild.channels.cache.find(c => c.name.toLowerCase().includes(name.toLowerCase()));
 }
 
-// ─── ALPACA PAPER API OPTIONS ─────────────────────────────
+// ─── ALPACA HEADERS ──────────────────────────────────────
+
+const alpacaHeaders = {
+  'APCA-API-KEY-ID': ALPACA_KEY,
+  'APCA-API-SECRET-KEY': ALPACA_SECRET,
+};
+
+// ─── GET STOCK PRICE ─────────────────────────────────────
+
+async function getStockPrice(ticker) {
+  try {
+    const res = await fetch(
+      `https://data.alpaca.markets/v2/stocks/${ticker}/trades/latest`,
+      { headers: alpacaHeaders }
+    );
+    const data = await res.json();
+    return data?.trade?.p || 0;
+  } catch (e) {
+    console.error('Price error:', e.message);
+    return 0;
+  }
+}
+
+// ─── GET BEST OPTIONS CONTRACT ───────────────────────────
 
 async function getBestContract(ticker, type) {
   try {
     const isCall = type.toUpperCase() === 'CALL';
     const optionType = isCall ? 'call' : 'put';
 
-    // Get stock price
-    const priceRes = await fetch(
-      `https://data.alpaca.markets/v2/stocks/${ticker}/trades/latest`,
-      {
-        headers: {
-          'APCA-API-KEY-ID': ALPACA_KEY,
-          'APCA-API-SECRET-KEY': ALPACA_SECRET,
-        }
-      }
-    );
-    const priceData = await priceRes.json();
-    const currentPrice = priceData?.trade?.p || 0;
+    // Get current stock price
+    const currentPrice = await getStockPrice(ticker);
     console.log(`📊 ${ticker} price: $${currentPrice}`);
 
-    // Date range — 7 to 30 days out
+    // Look for contracts 7-21 days out
     const today = new Date();
     const minDate = new Date();
     minDate.setDate(today.getDate() + 7);
     const maxDate = new Date();
-    maxDate.setDate(today.getDate() + 30);
+    maxDate.setDate(today.getDate() + 21);
     const minDateStr = minDate.toISOString().split('T')[0];
     const maxDateStr = maxDate.toISOString().split('T')[0];
 
-    // Get contracts from paper API
+    // Get contracts list
     const contractsRes = await fetch(
       `https://paper-api.alpaca.markets/v2/options/contracts?underlying_symbols=${ticker}&type=${optionType}&expiration_date_gte=${minDateStr}&expiration_date_lte=${maxDateStr}&status=active&limit=50`,
-      {
-        headers: {
-          'APCA-API-KEY-ID': ALPACA_KEY,
-          'APCA-API-SECRET-KEY': ALPACA_SECRET,
-        }
-      }
+      { headers: alpacaHeaders }
     );
 
     const contractsData = await contractsRes.json();
-    const contracts = contractsData?.option_contracts || [];
+    let contracts = contractsData?.option_contracts || [];
     console.log(`📋 Found ${contracts.length} contracts for ${ticker}`);
+
+    // If no contracts in 7-21 days, try 5-30 days
+    if (contracts.length === 0) {
+      const minDate2 = new Date();
+      minDate2.setDate(today.getDate() + 5);
+      const maxDate2 = new Date();
+      maxDate2.setDate(today.getDate() + 30);
+      const contractsRes2 = await fetch(
+        `https://paper-api.alpaca.markets/v2/options/contracts?underlying_symbols=${ticker}&type=${optionType}&expiration_date_gte=${minDate2.toISOString().split('T')[0]}&expiration_date_lte=${maxDate2.toISOString().split('T')[0]}&status=active&limit=50`,
+        { headers: alpacaHeaders }
+      );
+      const data2 = await contractsRes2.json();
+      contracts = data2?.option_contracts || [];
+      console.log(`📋 Extended search: ${contracts.length} contracts`);
+    }
 
     if (contracts.length === 0) return null;
 
-    // Score contracts
-    const scored = contracts.map(c => {
-      const expDate = new Date(c.expiration_date);
-      const daysOut = Math.floor((expDate - today) / (1000 * 60 * 60 * 24));
-      const strike = parseFloat(c.strike_price) || 0;
-      const closePrice = parseFloat(c.close_price) || 0;
-      const oi = parseInt(c.open_interest) || 0;
-      const expFormatted = expDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    // Get symbols for snapshot
+    const symbols = contracts.slice(0, 30).map(c => c.symbol).join(',');
 
-      // Prefer ATM contracts (strike close to current price)
-      const distanceFromATM = Math.abs(strike - currentPrice);
-      const atm_pct = currentPrice > 0 ? distanceFromATM / currentPrice : 1;
+    // Get snapshots with full data — delta, bid, ask, IV, volume
+    const snapshotRes = await fetch(
+      `https://data.alpaca.markets/v1beta1/options/snapshots?symbols=${symbols}&feed=indicative`,
+      { headers: alpacaHeaders }
+    );
 
-      let score = 0;
-      if (daysOut >= 7 && daysOut <= 21) score += 40;
-      else if (daysOut >= 5 && daysOut <= 30) score += 20;
-      if (atm_pct < 0.02) score += 40; // very close to ATM
-      else if (atm_pct < 0.05) score += 25;
-      else if (atm_pct < 0.10) score += 10;
-      if (oi > 10) score += 20;
-      if (oi > 100) score += 10;
+    const snapshotData = await snapshotRes.json();
+    const snapshots = snapshotData?.snapshots || {};
+    console.log(`📊 Got snapshots for ${Object.keys(snapshots).length} contracts`);
 
-      // For calls: slightly OTM is better
-      // For puts: slightly OTM is better
-      if (isCall && strike > currentPrice && strike < currentPrice * 1.05) score += 15;
-      if (!isCall && strike < currentPrice && strike > currentPrice * 0.95) score += 15;
+    // Score each contract
+    const scored = contracts
+      .map(c => {
+        const snap = snapshots[c.symbol];
+        if (!snap) return null;
 
-      return { strike, closePrice, oi, daysOut, expDate: expFormatted, score, currentPrice, symbol: c.symbol };
-    })
-    .filter(c => c.daysOut >= 5 && c.daysOut <= 35)
-    .sort((a, b) => b.score - a.score);
+        const greeks = snap.greeks || {};
+        const quote = snap.latestQuote || {};
+        const bar = snap.dailyBar || {};
 
-    if (scored.length === 0) return null;
+        const delta = Math.abs(greeks.delta || 0);
+        const bid = quote.bp || 0;
+        const ask = quote.ap || 0;
+        const volume = bar.v || 0;
+        const iv = snap.impliedVolatility || 0;
+        const strike = parseFloat(c.strike_price) || 0;
+        const oi = parseInt(c.open_interest) || 0;
+        const expDate = new Date(c.expiration_date);
+        const daysOut = Math.floor((expDate - today) / (1000 * 60 * 60 * 24));
+        const spread = ask - bid;
+        const expFormatted = expDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+
+        // Score — prefer delta 0.35-0.55, good liquidity, tight spread
+        let score = 0;
+        if (delta >= 0.40 && delta <= 0.55) score += 50;
+        else if (delta >= 0.30 && delta <= 0.65) score += 30;
+        else if (delta >= 0.20 && delta <= 0.75) score += 10;
+        if (daysOut >= 7 && daysOut <= 21) score += 30;
+        else if (daysOut >= 5 && daysOut <= 30) score += 15;
+        if (volume > 500) score += 20;
+        else if (volume > 100) score += 10;
+        if (ask > 0 && spread / ask < 0.10) score += 15;
+        else if (ask > 0 && spread / ask < 0.20) score += 5;
+        if (oi > 100) score += 10;
+
+        return { 
+          symbol: c.symbol, strike, bid, ask, delta, iv, volume, oi, 
+          daysOut, expDate: expFormatted, score, spread, currentPrice 
+        };
+      })
+      .filter(c => c && c.ask > 0 && c.bid > 0 && c.daysOut >= 5)
+      .sort((a, b) => b.score - a.score);
+
+    if (scored.length === 0) {
+      console.log('❌ No contracts with snapshot data');
+      return null;
+    }
 
     const best = scored[0];
-    console.log(`✅ Best: ${best.symbol} Strike $${best.strike} Exp ${best.expDate} Close $${best.closePrice}`);
+    console.log(`✅ Best: ${best.symbol} Strike $${best.strike} Delta ${best.delta?.toFixed(2)} Bid $${best.bid} Ask $${best.ask}`);
     return best;
 
   } catch (err) {
-    console.error('❌ Alpaca options error:', err.message);
+    console.error('❌ Options error:', err.message);
     return null;
   }
 }
@@ -119,19 +166,18 @@ async function getBestContract(ticker, type) {
 
 function parseAlert(text) {
   const clean = text.trim().toUpperCase();
-  const words = clean.split(/\s+/);
   return {
-    ticker: words[0],
+    ticker: clean.split(/\s+/)[0],
     type: clean.includes('CALL') ? 'CALL' : clean.includes('PUT') ? 'PUT' : null,
   };
 }
 
 // ─── FORMAT SIGNAL ────────────────────────────────────────
 
-function formatSignal(ticker, type, contract) {
+function formatSignal(ticker, type, c) {
   const typeEmoji = type === 'CALL' ? 'Call 📈' : 'Put 📉';
 
-  if (!contract) {
+  if (!c) {
     return `⚡ **OPTIONS X SIGNAL**
 
 📌 **Ticker:** ${ticker}
@@ -143,22 +189,27 @@ function formatSignal(ticker, type, contract) {
 ⚠️ *Always confirm entry on 15m before executing*`;
   }
 
-  // Estimate entry from close price
-  const entryLow = (contract.closePrice * 0.97).toFixed(2);
-  const entryHigh = (contract.closePrice * 1.03).toFixed(2);
-  const stop = (contract.closePrice * 0.55).toFixed(2);
-  const target = (contract.closePrice * 2.0).toFixed(2);
+  const entryLow = c.bid.toFixed(2);
+  const entryHigh = c.ask.toFixed(2);
+  const stop = (c.bid * 0.55).toFixed(2);
+  const target = (c.ask * 2.0).toFixed(2);
+  const ivPct = (c.iv * 100).toFixed(1);
+  const spreadPct = c.ask > 0 ? ((c.spread / c.ask) * 100).toFixed(1) : 'N/A';
 
   return `⚡ **OPTIONS X SIGNAL**
 
-📌 **Ticker:** ${ticker}
+📌 **Ticker:** ${ticker} @ $${c.currentPrice}
 📊 **Type:** ${typeEmoji}
-🎯 **Strike:** $${contract.strike}
-📅 **Exp:** ${contract.expDate} (${contract.daysOut} days)
+🎯 **Strike:** $${c.strike}
+📅 **Exp:** ${c.expDate} (${c.daysOut} days)
 💰 **Entry:** $${entryLow} — $${entryHigh}
-🛑 **Stop Loss:** $${stop}
-✅ **Target:** $${target}+
-📊 **Open Interest:** ${contract.oi?.toLocaleString()}
+🛑 **Stop Loss:** $${stop} (45% below bid)
+✅ **Target:** $${target}+ (2x)
+📊 **Delta:** ${c.delta?.toFixed(2)}
+📊 **IV:** ${ivPct}%
+📊 **Volume:** ${c.volume?.toLocaleString()}
+📊 **Open Interest:** ${c.oi?.toLocaleString()}
+📊 **Spread:** ${spreadPct}%
 📈 **Setup:** Key level triggered — confirm on 15m
 ⚠️ **Risk:** Medium
 🔢 **Suggested contracts:** 1-3
@@ -166,7 +217,7 @@ function formatSignal(ticker, type, contract) {
 ⚠️ *Always confirm entry on 15m before executing*`;
 }
 
-// ─── WEBHOOK ENDPOINT ─────────────────────────────────────
+// ─── WEBHOOK ─────────────────────────────────────────────
 
 app.post('/webhook', async (req, res) => {
   try {
@@ -176,7 +227,7 @@ app.post('/webhook', async (req, res) => {
     else if (req.body?.text) alertText = req.body.text;
     else alertText = JSON.stringify(req.body);
 
-    console.log('📨 Alert received:', alertText);
+    console.log('📨 Alert:', alertText);
 
     const parsed = parseAlert(alertText);
     if (!parsed.ticker || !parsed.type) {
@@ -186,14 +237,14 @@ app.post('/webhook', async (req, res) => {
     const guild = client.guilds.cache.first();
     if (!guild) return res.status(500).json({ error: 'Bot not in guild' });
 
-    console.log(`🔍 Fetching best ${parsed.type} for ${parsed.ticker}...`);
+    console.log(`🔍 Fetching ${parsed.type} contracts for ${parsed.ticker}...`);
     const contract = await getBestContract(parsed.ticker, parsed.type);
     const message = formatSignal(parsed.ticker, parsed.type, contract);
 
     const premiumCh = getChannel(guild, 'premium-signals');
     if (premiumCh) {
       await premiumCh.send(message);
-      console.log(`✅ Signal posted: ${parsed.ticker} ${parsed.type}`);
+      console.log(`✅ Signal posted`);
     }
 
     if (['SPY', 'QQQ'].includes(parsed.ticker)) {
@@ -203,7 +254,7 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    res.json({ success: true, ticker: parsed.ticker, type: parsed.type });
+    res.json({ success: true, ticker: parsed.ticker, type: parsed.type, contract: contract?.symbol || 'not found' });
 
   } catch (error) {
     console.error('❌ Error:', error);
@@ -211,15 +262,13 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ─── HEALTH CHECK ─────────────────────────────────────────
-
 app.get('/', (req, res) => {
   res.json({
     status: '⚡ Options X Webhook Active',
-    format: 'Send: NVDA CALL or SPY PUT',
-    dataSource: 'Alpaca Paper API',
+    format: 'NVDA CALL or SPY PUT',
+    dataSource: 'Alpaca — Delta, IV, Bid, Ask, Volume',
     timestamp: new Date().toISOString()
   });
 });
 
-app.listen(PORT, () => console.log(`🚀 Webhook server on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Webhook on port ${PORT}`));
