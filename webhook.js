@@ -6,6 +6,8 @@ app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
 const TOKEN = process.env.DISCORD_TOKEN;
+const ALPACA_KEY = process.env.ALPACA_KEY;
+const ALPACA_SECRET = process.env.ALPACA_SECRET;
 const PORT = process.env.PORT || 3000;
 
 const client = new Client({
@@ -22,67 +24,93 @@ function getChannel(guild, name) {
   return guild.channels.cache.find(c => c.name.toLowerCase().includes(name.toLowerCase()));
 }
 
-// ─── YAHOO FINANCE OPTIONS ────────────────────────────────
+// ─── ALPACA PAPER API OPTIONS ─────────────────────────────
 
 async function getBestContract(ticker, type) {
   try {
     const isCall = type.toUpperCase() === 'CALL';
+    const optionType = isCall ? 'call' : 'put';
 
-    const res = await fetch(
-      `https://query1.finance.yahoo.com/v7/finance/options/${ticker}`,
+    // Get stock price
+    const priceRes = await fetch(
+      `https://data.alpaca.markets/v2/stocks/${ticker}/trades/latest`,
       {
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'application/json',
+          'APCA-API-KEY-ID': ALPACA_KEY,
+          'APCA-API-SECRET-KEY': ALPACA_SECRET,
+        }
+      }
+    );
+    const priceData = await priceRes.json();
+    const currentPrice = priceData?.trade?.p || 0;
+    console.log(`📊 ${ticker} price: $${currentPrice}`);
+
+    // Date range — 7 to 30 days out
+    const today = new Date();
+    const minDate = new Date();
+    minDate.setDate(today.getDate() + 7);
+    const maxDate = new Date();
+    maxDate.setDate(today.getDate() + 30);
+    const minDateStr = minDate.toISOString().split('T')[0];
+    const maxDateStr = maxDate.toISOString().split('T')[0];
+
+    // Get contracts from paper API
+    const contractsRes = await fetch(
+      `https://paper-api.alpaca.markets/v2/options/contracts?underlying_symbols=${ticker}&type=${optionType}&expiration_date_gte=${minDateStr}&expiration_date_lte=${maxDateStr}&status=active&limit=50`,
+      {
+        headers: {
+          'APCA-API-KEY-ID': ALPACA_KEY,
+          'APCA-API-SECRET-KEY': ALPACA_SECRET,
         }
       }
     );
 
-    const data = await res.json();
-    const result = data?.optionChain?.result?.[0];
-    if (!result) { console.log('❌ No Yahoo data for', ticker); return null; }
+    const contractsData = await contractsRes.json();
+    const contracts = contractsData?.option_contracts || [];
+    console.log(`📋 Found ${contracts.length} contracts for ${ticker}`);
 
-    const currentPrice = result?.quote?.regularMarketPrice || 0;
-    console.log(`📊 ${ticker} price: $${currentPrice}`);
+    if (contracts.length === 0) return null;
 
-    const options = result?.options?.[0];
-    const contracts = isCall ? options?.calls : options?.puts;
-    if (!contracts || contracts.length === 0) { console.log('❌ No contracts found'); return null; }
+    // Score contracts
+    const scored = contracts.map(c => {
+      const expDate = new Date(c.expiration_date);
+      const daysOut = Math.floor((expDate - today) / (1000 * 60 * 60 * 24));
+      const strike = parseFloat(c.strike_price) || 0;
+      const closePrice = parseFloat(c.close_price) || 0;
+      const oi = parseInt(c.open_interest) || 0;
+      const expFormatted = expDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 
-    const today = new Date();
-    const scored = contracts
-      .map(c => {
-        const expDate = new Date(c.expiration * 1000);
-        const daysOut = Math.floor((expDate - today) / (1000 * 60 * 60 * 24));
-        const volume = c.volume || 0;
-        const oi = c.openInterest || 0;
-        const ask = c.ask || 0;
-        const bid = c.bid || 0;
-        const strike = c.strike || 0;
-        const spread = ask - bid;
-        const expFormatted = expDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+      // Prefer ATM contracts (strike close to current price)
+      const distanceFromATM = Math.abs(strike - currentPrice);
+      const atm_pct = currentPrice > 0 ? distanceFromATM / currentPrice : 1;
 
-        let score = 0;
-        if (daysOut >= 7 && daysOut <= 21) score += 40;
-        else if (daysOut >= 5 && daysOut <= 30) score += 20;
-        if (volume > 500) score += 30;
-        else if (volume > 100) score += 15;
-        if (oi > 1000) score += 20;
-        else if (oi > 500) score += 10;
-        if (ask > 0 && spread < ask * 0.15) score += 10;
+      let score = 0;
+      if (daysOut >= 7 && daysOut <= 21) score += 40;
+      else if (daysOut >= 5 && daysOut <= 30) score += 20;
+      if (atm_pct < 0.02) score += 40; // very close to ATM
+      else if (atm_pct < 0.05) score += 25;
+      else if (atm_pct < 0.10) score += 10;
+      if (oi > 10) score += 20;
+      if (oi > 100) score += 10;
 
-        return { strike, ask, bid, spread, volume, oi, daysOut, expDate: expFormatted, score, currentPrice };
-      })
-      .filter(c => c.daysOut >= 3 && c.daysOut <= 60 && c.ask > 0)
-      .sort((a, b) => b.score - a.score);
+      // For calls: slightly OTM is better
+      // For puts: slightly OTM is better
+      if (isCall && strike > currentPrice && strike < currentPrice * 1.05) score += 15;
+      if (!isCall && strike < currentPrice && strike > currentPrice * 0.95) score += 15;
 
-    if (scored.length === 0) { console.log('❌ No valid contracts after filter'); return null; }
+      return { strike, closePrice, oi, daysOut, expDate: expFormatted, score, currentPrice, symbol: c.symbol };
+    })
+    .filter(c => c.daysOut >= 5 && c.daysOut <= 35)
+    .sort((a, b) => b.score - a.score);
 
-    console.log(`✅ Best: Strike $${scored[0].strike} Exp ${scored[0].expDate} Ask $${scored[0].ask}`);
-    return scored[0];
+    if (scored.length === 0) return null;
+
+    const best = scored[0];
+    console.log(`✅ Best: ${best.symbol} Strike $${best.strike} Exp ${best.expDate} Close $${best.closePrice}`);
+    return best;
 
   } catch (err) {
-    console.error('❌ Yahoo Finance error:', err.message);
+    console.error('❌ Alpaca options error:', err.message);
     return null;
   }
 }
@@ -115,10 +143,11 @@ function formatSignal(ticker, type, contract) {
 ⚠️ *Always confirm entry on 15m before executing*`;
   }
 
-  const entryLow = (contract.bid * 0.98).toFixed(2);
-  const entryHigh = (contract.ask * 1.02).toFixed(2);
-  const stop = (contract.bid * 0.55).toFixed(2);
-  const target = (contract.ask * 2.0).toFixed(2);
+  // Estimate entry from close price
+  const entryLow = (contract.closePrice * 0.97).toFixed(2);
+  const entryHigh = (contract.closePrice * 1.03).toFixed(2);
+  const stop = (contract.closePrice * 0.55).toFixed(2);
+  const target = (contract.closePrice * 2.0).toFixed(2);
 
   return `⚡ **OPTIONS X SIGNAL**
 
@@ -129,7 +158,6 @@ function formatSignal(ticker, type, contract) {
 💰 **Entry:** $${entryLow} — $${entryHigh}
 🛑 **Stop Loss:** $${stop}
 ✅ **Target:** $${target}+
-📊 **Volume:** ${contract.volume?.toLocaleString()}
 📊 **Open Interest:** ${contract.oi?.toLocaleString()}
 📈 **Setup:** Key level triggered — confirm on 15m
 ⚠️ **Risk:** Medium
@@ -189,7 +217,7 @@ app.get('/', (req, res) => {
   res.json({
     status: '⚡ Options X Webhook Active',
     format: 'Send: NVDA CALL or SPY PUT',
-    dataSource: 'Yahoo Finance',
+    dataSource: 'Alpaca Paper API',
     timestamp: new Date().toISOString()
   });
 });
