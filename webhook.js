@@ -73,7 +73,7 @@ async function getBestContract(ticker, type) {
 
         return { strike, ask, bid, spread, volume, oi, daysOut, expDate: expFormatted, score, currentPrice };
       })
-      .filter(c => c.daysOut >= 5 && c.daysOut <= 30 && c.ask > 0 && c.ask < 50)
+      .filter(c => c.daysOut >= 3 && c.daysOut <= 60 && c.ask > 0)
       .sort((a, b) => b.score - a.score);
 
     if (scored.length === 0) { console.log('❌ No valid contracts after filter'); return null; }
