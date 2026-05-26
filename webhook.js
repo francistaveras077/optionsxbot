@@ -21,8 +21,6 @@ function getChannel(guild, name) {
   return guild.channels.cache.find(c => c.name.toLowerCase().includes(name.toLowerCase()));
 }
 
-// ─── ALPACA HEADERS ──────────────────────────────────────
-
 const alpacaHeaders = {
   'APCA-API-KEY-ID': ALPACA_KEY,
   'APCA-API-SECRET-KEY': ALPACA_SECRET,
@@ -39,72 +37,57 @@ async function getStockPrice(ticker) {
     const data = await res.json();
     return data?.trade?.p || 0;
   } catch (e) {
-    console.error('Price error:', e.message);
     return 0;
   }
 }
 
-// ─── GET BEST OPTIONS CONTRACT ───────────────────────────
+// ─── GET BEST CONTRACT ────────────────────────────────────
 
 async function getBestContract(ticker, type) {
   try {
     const isCall = type.toUpperCase() === 'CALL';
     const optionType = isCall ? 'call' : 'put';
 
-    // Get current stock price
     const currentPrice = await getStockPrice(ticker);
-    console.log(`📊 ${ticker} price: $${currentPrice}`);
+    console.log(`📊 ${ticker}: $${currentPrice}`);
 
-    // Look for contracts 7-21 days out
     const today = new Date();
     const minDate = new Date();
     minDate.setDate(today.getDate() + 7);
     const maxDate = new Date();
     maxDate.setDate(today.getDate() + 21);
-    const minDateStr = minDate.toISOString().split('T')[0];
-    const maxDateStr = maxDate.toISOString().split('T')[0];
 
-    // Get contracts list
     const contractsRes = await fetch(
-      `https://paper-api.alpaca.markets/v2/options/contracts?underlying_symbols=${ticker}&type=${optionType}&expiration_date_gte=${minDateStr}&expiration_date_lte=${maxDateStr}&status=active&limit=50`,
+      `https://paper-api.alpaca.markets/v2/options/contracts?underlying_symbols=${ticker}&type=${optionType}&expiration_date_gte=${minDate.toISOString().split('T')[0]}&expiration_date_lte=${maxDate.toISOString().split('T')[0]}&status=active&limit=50`,
       { headers: alpacaHeaders }
     );
 
     const contractsData = await contractsRes.json();
     let contracts = contractsData?.option_contracts || [];
-    console.log(`📋 Found ${contracts.length} contracts for ${ticker}`);
 
-    // If no contracts in 7-21 days, try 5-30 days
     if (contracts.length === 0) {
       const minDate2 = new Date();
       minDate2.setDate(today.getDate() + 5);
       const maxDate2 = new Date();
       maxDate2.setDate(today.getDate() + 30);
-      const contractsRes2 = await fetch(
+      const res2 = await fetch(
         `https://paper-api.alpaca.markets/v2/options/contracts?underlying_symbols=${ticker}&type=${optionType}&expiration_date_gte=${minDate2.toISOString().split('T')[0]}&expiration_date_lte=${maxDate2.toISOString().split('T')[0]}&status=active&limit=50`,
         { headers: alpacaHeaders }
       );
-      const data2 = await contractsRes2.json();
-      contracts = data2?.option_contracts || [];
-      console.log(`📋 Extended search: ${contracts.length} contracts`);
+      contracts = (await res2.json())?.option_contracts || [];
     }
 
     if (contracts.length === 0) return null;
 
-    // Get symbols for snapshot
     const symbols = contracts.slice(0, 30).map(c => c.symbol).join(',');
 
-    // Get snapshots with full data — delta, bid, ask, IV, volume
     const snapshotRes = await fetch(
       `https://data.alpaca.markets/v1beta1/options/snapshots?symbols=${symbols}&feed=indicative`,
       { headers: alpacaHeaders }
     );
 
-    const snapshotData = await snapshotRes.json();
-    const snapshots = snapshotData?.snapshots || {};
-    console.log(`📊 Got snapshots for ${Object.keys(snapshots).length} contracts`);
+    const snapshots = (await snapshotRes.json())?.snapshots || {};
 
-    // Score each contract
     const scored = contracts
       .map(c => {
         const snap = snapshots[c.symbol];
@@ -115,6 +98,9 @@ async function getBestContract(ticker, type) {
         const bar = snap.dailyBar || {};
 
         const delta = Math.abs(greeks.delta || 0);
+        const gamma = greeks.gamma || 0;
+        const theta = greeks.theta || 0;
+        const vega = greeks.vega || 0;
         const bid = quote.bp || 0;
         const ask = quote.ap || 0;
         const volume = bar.v || 0;
@@ -126,7 +112,6 @@ async function getBestContract(ticker, type) {
         const spread = ask - bid;
         const expFormatted = expDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 
-        // Score — prefer delta 0.35-0.55, good liquidity, tight spread
         let score = 0;
         if (delta >= 0.40 && delta <= 0.55) score += 50;
         else if (delta >= 0.30 && delta <= 0.65) score += 30;
@@ -139,22 +124,15 @@ async function getBestContract(ticker, type) {
         else if (ask > 0 && spread / ask < 0.20) score += 5;
         if (oi > 100) score += 10;
 
-        return { 
-          symbol: c.symbol, strike, bid, ask, delta, iv, volume, oi, 
-          daysOut, expDate: expFormatted, score, spread, currentPrice 
+        return {
+          symbol: c.symbol, strike, bid, ask, delta, gamma, theta, vega,
+          iv, volume, oi, daysOut, expDate: expFormatted, score, spread, currentPrice
         };
       })
       .filter(c => c && c.ask > 0 && c.bid > 0 && c.daysOut >= 5)
       .sort((a, b) => b.score - a.score);
 
-    if (scored.length === 0) {
-      console.log('❌ No contracts with snapshot data');
-      return null;
-    }
-
-    const best = scored[0];
-    console.log(`✅ Best: ${best.symbol} Strike $${best.strike} Delta ${best.delta?.toFixed(2)} Bid $${best.bid} Ask $${best.ask}`);
-    return best;
+    return scored[0] || null;
 
   } catch (err) {
     console.error('❌ Options error:', err.message);
@@ -166,35 +144,55 @@ async function getBestContract(ticker, type) {
 
 function parseAlert(text) {
   const clean = text.trim().toUpperCase();
-  return {
-    ticker: clean.split(/\s+/)[0],
-    type: clean.includes('CALL') ? 'CALL' : clean.includes('PUT') ? 'PUT' : null,
-  };
+  const words = clean.split(/\s+/);
+  const ticker = words[0];
+  const type = clean.includes('CALL') ? 'CALL' : clean.includes('PUT') ? 'PUT' : null;
+
+  // Extract setup if provided — everything after CALL/PUT
+  const setupMatch = clean.match(/(?:CALL|PUT)\s+(.+)/);
+  const setup = setupMatch ? setupMatch[1].replace(/\+/g, ' + ') : null;
+
+  return { ticker, type, setup };
 }
 
 // ─── FORMAT SIGNAL ────────────────────────────────────────
 
-function formatSignal(ticker, type, c) {
+function formatSignal(ticker, type, setup, c) {
   const typeEmoji = type === 'CALL' ? 'Call 📈' : 'Put 📉';
+  const setupText = setup || 'Key level triggered';
 
   if (!c) {
     return `⚡ **OPTIONS X SIGNAL**
 
 📌 **Ticker:** ${ticker}
 📊 **Type:** ${typeEmoji}
+📈 **Setup:** ${setupText} — confirm on 15m
 ⚠️ *Options data unavailable — check chain manually*
-📈 **Setup:** Key level triggered — confirm on 15m
 🔢 **Suggested contracts:** 1-3
 
 ⚠️ *Always confirm entry on 15m before executing*`;
   }
 
-  const entryLow = c.bid.toFixed(2);
-  const entryHigh = c.ask.toFixed(2);
   const stop = (c.bid * 0.55).toFixed(2);
   const target = (c.ask * 2.0).toFixed(2);
+  const risk = c.bid;
+  const reward = c.ask * 2.0 - c.ask;
+  const rr = (reward / risk).toFixed(1);
   const ivPct = (c.iv * 100).toFixed(1);
   const spreadPct = c.ask > 0 ? ((c.spread / c.ask) * 100).toFixed(1) : 'N/A';
+
+  // Delta quality rating
+  let deltaRating = '';
+  if (c.delta >= 0.45 && c.delta <= 0.55) deltaRating = '🟢 ATM';
+  else if (c.delta >= 0.35 && c.delta <= 0.65) deltaRating = '🟡 Near ATM';
+  else if (c.delta > 0.65) deltaRating = '🔵 ITM';
+  else deltaRating = '🔴 OTM';
+
+  // IV rating
+  let ivRating = '';
+  if (c.iv < 0.30) ivRating = '🟢 Low';
+  else if (c.iv < 0.50) ivRating = '🟡 Normal';
+  else ivRating = '🔴 High';
 
   return `⚡ **OPTIONS X SIGNAL**
 
@@ -202,15 +200,20 @@ function formatSignal(ticker, type, c) {
 📊 **Type:** ${typeEmoji}
 🎯 **Strike:** $${c.strike}
 📅 **Exp:** ${c.expDate} (${c.daysOut} days)
-💰 **Entry:** $${entryLow} — $${entryHigh}
+
+💰 **Entry:** $${c.bid.toFixed(2)} — $${c.ask.toFixed(2)}
 🛑 **Stop Loss:** $${stop} (45% below bid)
 ✅ **Target:** $${target}+ (2x)
-📊 **Delta:** ${c.delta?.toFixed(2)}
-📊 **IV:** ${ivPct}%
+⚖️ **Risk/Reward:** 1:${rr}
+
+📊 **Delta:** ${c.delta.toFixed(2)} ${deltaRating}
+📊 **IV:** ${ivPct}% ${ivRating}
+📊 **Theta:** $${Math.abs(c.theta).toFixed(3)}/day
 📊 **Volume:** ${c.volume?.toLocaleString()}
 📊 **Open Interest:** ${c.oi?.toLocaleString()}
 📊 **Spread:** ${spreadPct}%
-📈 **Setup:** Key level triggered — confirm on 15m
+
+📈 **Setup:** ${setupText}
 ⚠️ **Risk:** Medium
 🔢 **Suggested contracts:** 1-3
 
@@ -231,21 +234,17 @@ app.post('/webhook', async (req, res) => {
 
     const parsed = parseAlert(alertText);
     if (!parsed.ticker || !parsed.type) {
-      return res.status(400).json({ error: 'Format: NVDA CALL or SPY PUT' });
+      return res.status(400).json({ error: 'Format: NVDA CALL or NVDA CALL CHoCH+EMA' });
     }
 
     const guild = client.guilds.cache.first();
     if (!guild) return res.status(500).json({ error: 'Bot not in guild' });
 
-    console.log(`🔍 Fetching ${parsed.type} contracts for ${parsed.ticker}...`);
     const contract = await getBestContract(parsed.ticker, parsed.type);
-    const message = formatSignal(parsed.ticker, parsed.type, contract);
+    const message = formatSignal(parsed.ticker, parsed.type, parsed.setup, contract);
 
     const premiumCh = getChannel(guild, 'premium-signals');
-    if (premiumCh) {
-      await premiumCh.send(message);
-      console.log(`✅ Signal posted`);
-    }
+    if (premiumCh) await premiumCh.send(message);
 
     if (['SPY', 'QQQ'].includes(parsed.ticker)) {
       const analysisCh = getChannel(guild, 'market-analysis');
@@ -254,7 +253,7 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    res.json({ success: true, ticker: parsed.ticker, type: parsed.type, contract: contract?.symbol || 'not found' });
+    res.json({ success: true, ticker: parsed.ticker, type: parsed.type });
 
   } catch (error) {
     console.error('❌ Error:', error);
@@ -265,8 +264,8 @@ app.post('/webhook', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     status: '⚡ Options X Webhook Active',
-    format: 'NVDA CALL or SPY PUT',
-    dataSource: 'Alpaca — Delta, IV, Bid, Ask, Volume',
+    format: 'NVDA CALL or NVDA CALL CHoCH+EMA',
+    features: ['Delta', 'IV', 'Theta', 'Volume', 'OI', 'Spread', 'Risk/Reward'],
     timestamp: new Date().toISOString()
   });
 });
